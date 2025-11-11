@@ -1,0 +1,256 @@
+Option Explicit
+
+'=========================================================
+' Configuration
+'=========================================================
+Private Const SEND_DIRECTLY As Boolean = True   ' True = send immediately; False = preview each email
+Private Const EMAIL_SUBJECT_PREFIX As String = "Payslip - " ' Subject will be "<prefix><period> - <B7>"
+Private Const EMAIL_BODY_HTML As String = _
+    "<p>Dear {NAME},</p>" & _
+    "<p>Please find attached your payslip for the period <b>{PERIOD}</b>.</p>" & _
+    "<p>If you have any questions, please reply to this email.</p>" & _
+    "<p>Best regards,<br>Payroll</p>"
+
+'=========================================================
+' Entry point
+'=========================================================
+Sub CreatePayslipPDFs()
+    Dim wb As Workbook
+    Dim wsCtl As Worksheet
+    Dim periodText As String
+    Dim folderPath As String
+    Dim fDialog As FileDialog
+    Dim ws As Worksheet
+    Dim fullPath As String
+    Dim empName As String
+    Dim fileName As String
+    Dim exportedCount As Long
+    Dim mailedCount As Long
+    Dim resp As VbMsgBoxResult
+    Dim recipient As String
+    
+    Dim olApp As Object        ' Outlook.Application
+    Dim olMail As Object       ' Outlook.MailItem
+    
+    On Error GoTo CleanFail
+    
+    Set wb = ThisWorkbook
+    
+    ' Validate control sheet exists
+    On Error Resume Next
+    Set wsCtl = wb.Worksheets("Create Pdf")
+    On Error GoTo CleanFail
+    If wsCtl Is Nothing Then
+        MsgBox "Sheet 'Create Pdf' not found. Please add it and put the cutoff period in H4.", vbExclamation
+        Exit Sub
+    End If
+    
+    ' === Confirm cutoff period from H4 ===
+    periodText = Trim(wsCtl.Range("H4").Text)
+    If Len(periodText) = 0 Then
+        resp = MsgBox( _
+            "Cell H4 (cutoff period) on 'Create Pdf' is blank." & vbCrLf & _
+            "Click Yes to enter it now and run the macro again, or No to cancel.", _
+            vbYesNo + vbExclamation, "Cutoff Period Missing")
+        If resp = vbYes Then
+            wsCtl.Activate
+            wsCtl.Range("H4").Select
+        End If
+        Exit Sub
+    End If
+    
+    resp = MsgBox( _
+        "Please confirm the cutoff period before proceeding:" & vbCrLf & vbCrLf & _
+        "Cutoff Period:  " & periodText & vbCrLf & vbCrLf & _
+        "Click Yes to generate PDFs and send emails, or No to cancel and edit H4.", _
+        vbYesNo + vbQuestion + vbDefaultButton2, "Confirm Cutoff Period")
+    If resp = vbNo Then
+        wsCtl.Activate
+        wsCtl.Range("H4").Select
+        Exit Sub
+    End If
+    
+    ' Choose save folder
+    Set fDialog = Application.FileDialog(msoFileDialogFolderPicker)
+    With fDialog
+        .Title = "Choose folder to save payslip PDFs"
+        .AllowMultiSelect = False
+        If .Show <> -1 Then
+            MsgBox "Export cancelled.", vbInformation
+            Exit Sub
+        End If
+        folderPath = .SelectedItems(1)
+    End With
+    
+    ' Try to get Outlook
+    Set olApp = GetOutlookApp()
+    If olApp Is Nothing Then
+        MsgBox "Outlook is not available or not configured." & vbCrLf & _
+               "PDFs will be created, but emails will be skipped.", vbExclamation
+    End If
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    
+    exportedCount = 0
+    mailedCount = 0
+    
+    ' Loop worksheets (visible only), skip "Create Pdf"
+    For Each ws In wb.Worksheets
+        If ws.Name <> wsCtl.Name And ws.Visible = xlSheetVisible Then
+            
+            empName = Trim(ws.Range("B7").Text)      ' employee/file name
+            recipient = Trim(ws.Range("P2").Text)    ' email address
+            
+            ' Only proceed if B7 has a name
+            If Len(empName) > 0 Then
+                ' Set fixed print area A1:K53
+                ws.PageSetup.PrintArea = "$A$1:$K$53"
+                
+                ' Fit on 1 page nicely
+                With ws.PageSetup
+                    .Orientation = xlPortrait
+                    .Zoom = False
+                    .FitToPagesWide = 1
+                    .FitToPagesTall = 1
+                    .LeftMargin = Application.InchesToPoints(0.25)
+                    .RightMargin = Application.InchesToPoints(0.25)
+                    .TopMargin = Application.InchesToPoints(0.5)
+                    .BottomMargin = Application.InchesToPoints(0.5)
+                End With
+                
+                ' Build file name: "<B7> - <period>.pdf"
+                fileName = SanitizeFileName(empName & " - " & periodText) & ".pdf"
+                fullPath = AddTrailingSlash(folderPath) & fileName
+                
+                ' Export to PDF using the print area
+                ws.ExportAsFixedFormat Type:=xlTypePDF, _
+                                       fileName:=fullPath, _
+                                       Quality:=xlQualityStandard, _
+                                       IncludeDocProperties:=True, _
+                                       IgnorePrintAreas:=False, _
+                                       OpenAfterPublish:=False
+                exportedCount = exportedCount + 1
+                
+                ' Send email if possible
+                If Not olApp Is Nothing Then
+                    If Len(recipient) > 0 And IsValidEmail(recipient) Then
+                        Set olMail = olApp.CreateItem(0) ' olMailItem
+                        With olMail
+                            .To = recipient
+                            .Subject = EMAIL_SUBJECT_PREFIX & periodText & " - " & empName
+                            .HTMLBody = BuildBodyHTML(empName, periodText)
+                            
+                            ' Attach the generated PDF
+                            .Attachments.Add fullPath
+                            
+                            If SEND_DIRECTLY Then
+                                .Send
+                                mailedCount = mailedCount + 1
+                            Else
+                                .Display    ' preview instead of sending
+                            End If
+                        End With
+                    ElseIf Len(recipient) > 0 Then
+                        ' P2 has something but doesn't look like an email
+                        Debug.Print "Invalid email for sheet '" & ws.Name & "': " & recipient
+                    Else
+                        ' No email provided; skip mailing
+                        Debug.Print "No email in P2 for sheet '" & ws.Name & "'."
+                    End If
+                End If
+                
+            End If
+        End If
+    Next ws
+    
+    MsgBox exportedCount & " payslip PDF(s) saved to:" & vbCrLf & folderPath & vbCrLf & vbCrLf & _
+           mailedCount & " email(s) sent via Outlook.", vbInformation
+    
+CleanExit:
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+
+CleanFail:
+    MsgBox "Something went wrong: " & Err.Description, vbExclamation
+    Resume CleanExit
+End Sub
+
+'=========================================================
+' Helpers
+'=========================================================
+
+' Sanitize file name for Windows/Mac
+Private Function SanitizeFileName(ByVal s As String) As String
+    Dim badChars As Variant
+    Dim i As Long
+    
+    badChars = Array("<", ">", ":", """", "/", "\", "|", "?", "*")
+    For i = LBound(badChars) To UBound(badChars)
+        s = Replace(s, badChars(i), "-")
+    Next i
+    
+    ' Remove trailing dots/spaces
+    s = Trim$(s)
+    Do While Len(s) > 0 And (Right$(s, 1) = "." Or Right$(s, 1) = " ")
+        s = Left$(s, Len(s) - 1)
+    Loop
+    
+    If Len(s) = 0 Then s = "Payslip"
+    SanitizeFileName = s
+End Function
+
+' Ensure folder path ends with correct separator (Windows "\" / Mac "/")
+Private Function AddTrailingSlash(ByVal p As String) As String
+    Dim sep As String
+    sep = Application.PathSeparator
+    If Len(p) = 0 Then
+        AddTrailingSlash = ""
+    ElseIf Right$(p, 1) = sep Then
+        AddTrailingSlash = p
+    Else
+        AddTrailingSlash = p & sep
+    End If
+End Function
+
+' Basic email validation (no references needed)
+Private Function IsValidEmail(ByVal s As String) As Boolean
+    On Error GoTo Invalid
+    Dim re As Object
+    Set re = CreateObject("VBScript.RegExp")
+    With re
+        .Pattern = "^[^@\s]+@[^@\s]+\.[^@\s]+$"
+        .IgnoreCase = True
+        IsValidEmail = .Test(Trim$(s))
+    End With
+    Exit Function
+Invalid:
+    ' Fallback: minimal check
+    IsValidEmail = (InStr(1, s, "@") > 1 And InStrRev(s, ".") > InStr(1, s, "@"))
+End Function
+
+' Get Outlook application (late binding)
+Private Function GetOutlookApp() As Object
+    On Error Resume Next
+    Dim olApp As Object
+    Set olApp = GetObject(, "Outlook.Application")
+    If olApp Is Nothing Then Set olApp = CreateObject("Outlook.Application")
+    On Error GoTo 0
+    Set GetOutlookApp = olApp
+End Function
+
+' Personalize email body using placeholders
+Private Function BuildBodyHTML(ByVal empName As String, ByVal periodText As String) As String
+    Dim body As String
+    body = EMAIL_BODY_HTML
+    body = Replace(body, "{NAME}", empName)
+    body = Replace(body, "{PERIOD}", periodText)
+    BuildBodyHTML = body
+End Function
+
+
+
+
