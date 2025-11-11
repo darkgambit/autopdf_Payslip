@@ -1,0 +1,160 @@
+
+Option Explicit
+
+'==== Entry point: attach this macro to your button on "Create Pdf" ====
+Sub CreatePayslipPDFs()
+    Dim wb As Workbook
+    Dim wsCtl As Worksheet
+    Dim periodText As String
+    Dim folderPath As String
+    Dim fDialog As FileDialog
+    Dim ws As Worksheet
+    Dim fullPath As String
+    Dim empName As String
+    Dim fileName As String
+    Dim exportedCount As Long
+    Dim resp As VbMsgBoxResult
+
+    On Error GoTo CleanFail
+
+    Set wb = ThisWorkbook
+
+    ' Validate control sheet exists
+    On Error Resume Next
+    Set wsCtl = wb.Worksheets("Create Pdf")
+    On Error GoTo CleanFail
+    If wsCtl Is Nothing Then
+        MsgBox "Sheet 'Create Pdf' not found. Please add it and put the cutoff period!", vbExclamation
+        Exit Sub
+    End If
+
+    ' === NEW: Get and confirm cutoff period from H4 ===
+    periodText = Trim(wsCtl.Range("H4").Text)
+    If Len(periodText) = 0 Then
+        resp = MsgBox( _
+            "Cell H4 (cutoff period) on 'Create Pdf' is blank." & vbCrLf & _
+            "Click Yes to enter it now and run the macro again, or No to cancel.", _
+            vbYesNo + vbExclamation, "Cutoff Period Missing")
+        If resp = vbYes Then
+            wsCtl.Activate
+            wsCtl.Range("H4").Select
+        End If
+        Exit Sub
+    End If
+
+    ' Confirm with the user before proceeding
+    resp = MsgBox( _
+        "Please confirm the cutoff period before proceeding:" & vbCrLf & vbCrLf & _
+        "Cutoff Period:  " & periodText & vbCrLf & vbCrLf & _
+        "Click Yes to generate PDFs, or No to cancel and edit H4.", _
+        vbYesNo + vbQuestion + vbDefaultButton2, "Confirm Cutoff Period")
+    If resp = vbNo Then
+        wsCtl.Activate
+        wsCtl.Range("H4").Select
+        Exit Sub
+    End If
+    ' === END NEW ===
+
+    ' Ask where to save
+    Set fDialog = Application.FileDialog(msoFileDialogFolderPicker)
+    With fDialog
+        .Title = "Choose folder to save payslip PDFs"
+        .AllowMultiSelect = False
+        If .Show <> -1 Then
+            MsgBox "Export cancelled.", vbInformation
+            Exit Sub
+        End If
+        folderPath = .SelectedItems(1)
+    End With
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+
+    exportedCount = 0
+
+    ' Loop worksheets (visible only), skip "Create Pdf"
+    For Each ws In wb.Worksheets
+        If ws.Name <> wsCtl.Name And ws.Visible = xlSheetVisible Then
+            empName = Trim(ws.Range("B7").Text)
+
+            ' Only export if B7 has a name
+            If Len(empName) > 0 Then
+                ' Set fixed print area A1:K53
+                ws.PageSetup.PrintArea = "$A$1:$K$53"
+
+                ' Fit on 1 page nicely
+                With ws.PageSetup
+                    .Orientation = xlPortrait
+                    .Zoom = False
+                    .FitToPagesWide = 1
+                    .FitToPagesTall = 1
+                    .LeftMargin = Application.InchesToPoints(0.25)
+                    .RightMargin = Application.InchesToPoints(0.25)
+                    .TopMargin = Application.InchesToPoints(0.5)
+                    .BottomMargin = Application.InchesToPoints(0.5)
+                End With
+
+                ' Build sanitized file name: "<B7> - <period>.pdf"
+                fileName = SanitizeFileName(empName & " - " & periodText) & ".pdf"
+                fullPath = AddTrailingSlash(folderPath) & fileName
+
+                ' Export to PDF using the print area
+                ws.ExportAsFixedFormat Type:=xlTypePDF, _
+                                       fileName:=fullPath, _
+                                       Quality:=xlQualityStandard, _
+                                       IncludeDocProperties:=True, _
+                                       IgnorePrintAreas:=False, _
+                                       OpenAfterPublish:=False
+                exportedCount = exportedCount + 1
+            End If
+        End If
+    Next ws
+
+    MsgBox exportedCount & " payslip PDF(s) saved to:" & vbCrLf & folderPath, vbInformation
+
+CleanExit:
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+
+CleanFail:
+    MsgBox "Something went wrong: " & Err.Description, vbExclamation
+    Resume CleanExit
+End Sub
+
+'==== Helper: sanitize file name for Windows/Mac ====
+Private Function SanitizeFileName(ByVal s As String) As String
+    Dim badChars As Variant
+    Dim i As Long
+
+    badChars = Array("<", ">", ":", """", "/", "\", "|", "?", "*")
+    For i = LBound(badChars) To UBound(badChars)
+        s = Replace(s, badChars(i), "-")
+    Next i
+
+    ' Remove trailing dots/spaces
+    s = Trim$(s)
+    Do While Len(s) > 0 And (Right$(s, 1) = "." Or Right$(s, 1) = " ")
+        s = Left$(s, Len(s) - 1)
+    Loop
+
+    If Len(s) = 0 Then s = "Payslip"
+    SanitizeFileName = s
+End Function
+
+'==== Helper: ensure folder path ends with the correct path separator ====
+Private Function AddTrailingSlash(ByVal p As String) As String
+    Dim sep As String
+    sep = Application.PathSeparator   ' "\" on Windows, "/" on Mac
+
+    If Len(p) = 0 Then
+        AddTrailingSlash = ""
+    ElseIf Right$(p, 1) = sep Then
+        AddTrailingSlash = p
+    Else
+        AddTrailingSlash = p & sep
+    End If
+End Function
+
